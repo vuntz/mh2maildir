@@ -1,0 +1,382 @@
+#!/usr/bin/perl
+#
+# Copyright © 2004 Vincent Untz <vincent vuntz.net>
+# 
+# This software is available under the GPL
+# http://www.gnu.org/licenses/gpl.txt
+# 
+# Originally based on http://rslomkow.org/Pretender/scripts/mh2Maildir
+# which is released under the GPL and is:
+# Copyright Robin * Slomkowski, 2003
+#
+# The convert_dirname function is based on the imap_utf7_encode_local function
+# from Squirrelmail. The encodeBASE64 is based on the function of the same
+# name from Squirrelmail.
+# Squirrelmail is released under the GPL and is:
+# Copyright (C) The SquirrelMail Project Team
+
+# Useful reference for maildir:
+# http://www.courier-mta.org/maildir.html
+
+use strict;
+use File::Copy;
+use Date::Parse;
+use Sys::Hostname;
+
+my $BASE_DIR = "$ENV{'HOME'}/Maildir";
+my $DEBUG = 0;
+my $use_sylpheed = 1;
+
+MAIN: {
+    my($src_dir, $dir_name, $start_dir, $dst_dir);
+
+    if ( $#ARGV < 0 ) {
+        usage();
+    }
+
+    $start_dir = shift @ARGV;
+
+    if ( "$ARGV[0]" ) {
+        $dst_dir = shift @ARGV;
+    } else {
+        $dst_dir = $BASE_DIR;
+    }
+    if (!($dst_dir =~ /\/$/)) {
+        $dst_dir .= "/";
+    }
+
+    -d $dst_dir or mkdir $dst_dir,0700 or die("Fatal: Directory $dst_dir doesn't exist and can't be created.\n");
+
+    convert_dir($start_dir, $dst_dir);
+
+    exit 0;
+}
+
+sub encodeBASE64 {
+    my $s = shift @_;
+    my $B64Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,';
+    my $p = 0;  # phase: 1 / 2 / 3 / 1 / 2 / 3...
+    my $e = ''; # base64-encoded string
+    my $t;
+    my $i;
+
+    for ($i = 0; $i < length($s); $i++) {
+            my $c = substr($s, $i, 1);
+            if ($p == 0) {
+                    $e .= substr($B64Chars, ((ord($c) & 252) >> 2), 1);
+                    $t = (ord($c) & 3);
+                    $p = 1;
+            } elsif ($p == 1) {
+                    $e .= substr($B64Chars, (($t << 4) + ((ord($c) & 240) >> 4)), 1);
+                    $t = (ord($c) & 15);
+                    $p = 2;
+            } elsif ($p == 2) {
+                    $e .= substr($B64Chars, (($t << 2) + ((ord($c) & 192) >> 6)), 1);
+                    $e .= substr($B64Chars, ord($c) & 63, 1);
+                    $p = 0;
+            }
+    }
+
+    # flush buffer
+    if ($p == 1) {
+            $e .= substr($B64Chars, $t << 4, 1);
+    } elsif ($p == 2) {
+            $e .= substr($B64Chars, $t << 2, 1);
+    }
+    return $e;
+}
+
+sub convert_dirname {
+    # input a directory
+    # output the final part of the name.
+    my $name = shift @_;
+    my $b64_s = '';    # buffer for substring to be base64-encoded
+    my $utf7_s = '';   # imap-utf7-encoded string
+    my $i;
+    $name =~ s@/$@@;
+    $name =~ s@^.*/@@;
+
+    for ($i = 0; $i < length($name); $i++) {
+            my $c = substr($name, $i, 1);
+            my $ord_c = ord($c);
+            if ((($ord_c >= 0x20) and ($ord_c <= 0x25)) or
+                (($ord_c >= 0x27) and ($ord_c <= 0x2d)) or
+                (($ord_c >= 0x30) and ($ord_c <= 0x7e))) {
+                    if ($b64_s) {
+                            $utf7_s = $utf7_s . '&' . encodeBASE64($b64_s) .'-';
+                            $b64_s = '';
+                    }
+                    $utf7_s = $utf7_s . $c;
+            } elsif ($ord_c == 0x26) { # ampersand
+                    if ($b64_s) {
+                            $utf7_s = $utf7_s . '&' . encodeBASE64($b64_s) . '-';
+                            $b64_s = '';
+                    }
+                    $utf7_s = $utf7_s . '&-';
+            } else {
+                    $b64_s = $b64_s . chr(0) . $c;
+            }
+    }
+
+    # flush buffer
+    if ($b64_s) {
+            $utf7_s = $utf7_s . '&' . encodeBASE64($b64_s) . '-';
+            $b64_s = '';
+    }
+    return $utf7_s;
+}
+
+sub find_time {
+    my $file = shift @_;
+    my $time = undef;
+
+    open DATA, $file;
+    while (<DATA>) {
+        # end headers
+        if ( $_ eq "\n" ) {
+            last;
+        }
+
+        if ($_ =~ /(for .*; |id .*; |^\s+)(\w+, \d+ \w{3} \d{4} \d+:\d+:\d+ [+\-]\d{4})/) {
+            my $timestring = $2;
+            my $t = str2time($timestring);
+            print "DEBUG5: $timestring -> $t\n" if $DEBUG > 1;
+            if ( $t > $time ) {
+                $time = $t;
+            }
+        }
+    }
+    close DATA;
+
+    if (!defined ($time)) {
+        # we use mtime
+        $time = (stat ($file))[9];
+        warn "WARN: no time found in $file" if $DEBUG > 0;
+    }
+
+    return $time;
+}
+
+sub find_all {
+    my $src_dir = shift @_;
+    my $file = shift @_;
+    my $time = undef;
+    my $flags;
+    my %info = ();
+
+    $flags = 'read';
+
+    $info{"new"} = 0;
+
+    if ($file =~ /^,/) { 
+        $flags .= 'deleted';
+        $info{"msgcount"} = $file;
+        $info{"msgcount"} =~ s/^,//;
+        $info{"host"} = hostname."del";
+    } else {
+        $info{"msgcount"} = $file;
+        $info{"host"} = hostname;
+    }
+
+    # OK now lets read the file
+    open DATA, "$src_dir/$file";
+
+    while (<DATA>) {
+        # end headers
+        if ( $_ eq "\n" ) {
+            last;
+        }
+
+        # check for replied
+        if ($_ =~ /^Replied: / && $flags !~ /reply/) {
+            $flags .= 'reply';
+        }
+
+        if ($_ =~ /(for .*; |id .*; |^\s+)(\w+, \d+ \w{3} \d{4} \d+:\d+:\d+ [+\-]\d{4})/) {
+            my $timestring = $2;
+            my $t = str2time($timestring);
+            print "DEBUG5: $timestring -> $t\n" if $DEBUG > 1;
+            if ( $t > $time ) {
+                $time = $t;
+            }
+        }
+    }
+    close DATA;
+
+    if (!defined ($time)) {
+        # we use mtime
+        $time = (stat ("$src_dir/$file"))[9];
+        warn "WARN: no time found in $src_dir/$file" if $DEBUG > 0;
+    }
+
+    $info{"time"} = $time;
+
+    $info{"flags"} = "";
+    $info{"flags"} .= 'R' if $flags =~ /reply/; # Replied to.
+    $info{"flags"} .= 'S' if $flags =~ /read/; # Seen or Read.
+    $info{"flags"} .= 'T' if $flags =~ /deleted/; # Tagged for deletion.
+
+    return %info;
+}
+
+sub convert_dir {
+    my $src_dir = shift @_;
+    my $dst_dir = shift @_;
+    my $msg_counter = 0;
+    my $no_sylpheed_mark;
+    my $dir_name;
+    my $folder;
+
+    $dir_name = convert_dirname($src_dir);
+    $dst_dir .= ".$dir_name";
+    maildirmake ($dst_dir);
+
+    $no_sylpheed_mark = (!-f "$src_dir/.sylpheed_mark" || !$use_sylpheed);
+    $folder = read_sylpheed_mark($src_dir) if (!$no_sylpheed_mark);
+    $no_sylpheed_mark = 1 if ($no_sylpheed_mark || keys (%$folder) == 0);
+
+    opendir DIR, "$src_dir" || die "$!: cannot open $src_dir\n";
+    foreach (readdir DIR) {
+        print "DEBUG1: print now working on $src_dir file $_\n" if $DEBUG > 1;
+
+        if (-d "$src_dir/$_" && $_ ne "." && $_ ne "..") {
+            convert_dir("$src_dir/$_", $dst_dir);
+        } elsif ( $_ =~ /^,{0,1}\d+$/  && -f "$src_dir/$_" ) {
+            my $file;
+            my $messagefn;
+            my $info;
+
+            $file = $_;
+            if ($no_sylpheed_mark) {
+                $info = find_all ($src_dir, $file);
+            } else {
+                $info = $folder->{$file};
+                $info->{"time"} = find_time ("$src_dir/$file");
+            }
+
+            if ($info->{"new"}) {
+                $messagefn = "new/";
+            } else {
+                $messagefn = "cur/";
+            }
+            # See http://www.courier-mta.org/maildir.html for the format of the
+            # file name.
+            $messagefn .= sprintf ("%d.%d_%d.%s:2,%s", $info->{"time"}, $$,
+                                    $info->{"msgcount"}, $info->{"host"}, $info->{"flags"});
+
+            copy "$src_dir/$file", "$dst_dir/$messagefn";
+            chmod 0600, "$dst_dir/$messagefn";
+            utime $info->{"time"}, $info->{"time"}, "$dst_dir/$messagefn";
+            $msg_counter++;
+            print "DEBUG: wrote $dst_dir/$messagefn\n" if $DEBUG > 0;
+        }
+    }
+
+    closedir DIR;
+    print "INFO: messages in ${dst_dir}: $msg_counter\n";
+}
+
+sub read_sylpheed_mark
+{
+    my $src_dir = shift @_;
+    my %folder = ();
+    my $version;
+    my $version_int;
+    my $message;
+    my $message_int;
+    my $flags;
+    my $flags_int;
+# Useful stuff defined in sylpheed source code:
+#
+#    From: defs.h:
+##define MARK_FILE        ".sylpheed_mark"
+##define MARK_VERSION     2
+#
+#    From procmsg.h:
+##define MSG_NEW          (1U << 0)
+##define MSG_UNREAD       (1U << 1)
+##define MSG_MARKED       (1U << 2)
+##define MSG_DELETED      (1U << 3)
+##define MSG_REPLIED      (1U << 4)
+##define MSG_FORWARDED    (1U << 5)
+#
+# The mark file is organized like this:
+#   * one 4 bytes integer containing the version number
+#   * then a loop:
+#       * 4 bytes integer for the message number
+#       * 4 bytes integer for the flags of the message
+#
+    open (MARK, "$src_dir/.sylpheed_mark") || return undef;
+    binmode MARK;
+    # read mark version number. We understand version 2.
+    if (read (MARK, $version, 4) != 4) {
+        print "$src_dir/.sylpheed_mark: corrupted .sylpheed_mark: no version number.\n";
+        return ();
+    }
+    $version_int = unpack ('I', $version);
+    if ($version_int != 2) {
+        print "$src_dir/.sylpheed_mark: .sylpheed_mark in a version we don't understand.\n";
+        return ();
+    }
+
+    while (1) {
+        if (read (MARK, $message, 4) != 4) {
+            return \%folder;
+        }
+        $message_int = unpack ('I', $message);
+        if (read (MARK, $flags, 4) != 4) {
+            print "$src_dir/.sylpheed_mark: corrupted .sylpheed_mark: there are no flags for message $message\n";
+            return \%folder;
+        }
+        $flags_int = unpack ('I', $flags);
+
+# How to write the info for maildir files, from
+# http://www.courier-mta.org/maildir.html:
+#     Here, info represents the state of the message, and it consists of zero
+#     or more boolean flags chosen from the following: "D" - this is a 'draft'
+#     message, "R" - this message has been replied to, "S" - this message has
+#     been viewed (seen), "T" - this message has been marked to be deleted
+#     (trashed), but is not yet removed (messages are removed from maildirs
+#     simply by deleting their file), "F" - this message has been marked by the
+#     user, for some purpose. These flags must be stored in alphabetical order.
+#     New messages contain only the :2, suffix, with no flags, indicating that
+#     the messages were not seen, replied, marked, or deleted.
+
+        $folder{$message_int}{"msgcount"} = $message_int;
+        $folder{$message_int}{"host"} = hostname;
+        if ($flags_int & 1) {
+            $folder{$message_int}{"new"} = 1;
+        } else {
+            $folder{$message_int}{"new"} = 0;
+        }
+
+        if (!$folder{$message_int}{"new"} == 1) {
+            $folder{$message_int}{"flags"} = "";
+            $folder{$message_int}{"flags"} .= "F" if ($flags_int & 4); # MSG_MARKED
+            $folder{$message_int}{"flags"} .= "R" if ($flags_int & 16); # MSG_REPLIED
+            $folder{$message_int}{"flags"} .= "S" if (!($flags_int & 2)); # MSG_UNREAD
+            $folder{$message_int}{"flags"} .= "T" if ($flags_int & 8); # MSG_DELETED
+        }
+    }
+}
+
+# The maildirmake function
+# ------------------------
+# 
+# It does the same thing that the maildirmake binary that 
+# comes with courier-imap distribution
+#
+sub maildirmake {
+    foreach(@_) {
+        -d $_ or mkdir $_,0700 or die("Fatal: Directory $_ doesn't exist and can't be created.\n");
+    
+        -d "$_/tmp" or mkdir("$_/tmp",0700) or die("Fatal: Unable to make $_/tmp/ subdirectory.\n");
+        -d "$_/new" or mkdir("$_/new",0700) or die("Fatal: Unable to make $_/new/ subdirectory.\n");
+        -d "$_/cur" or mkdir("$_/cur",0700) or die("Fatal: Unable to make $_/cur/ subdirectory.\n");
+    }
+}
+
+sub usage {
+    print "usage: $0 SourceDirectory/ [DestinationRoot/]\n";
+    exit 1;
+}
